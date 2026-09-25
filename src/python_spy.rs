@@ -4,6 +4,7 @@ use std::collections::HashSet;
 #[cfg(all(target_os = "linux", feature = "unwind"))]
 use std::iter::FromIterator;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, Result};
 use remoteprocess::{Pid, Process, ProcessMemory, Tid};
@@ -36,7 +37,8 @@ pub struct PythonSpy {
     pub native: Option<NativeStack>,
     pub short_filenames: HashMap<String, Option<String>>,
     pub python_thread_ids: HashMap<u64, Tid>,
-    pub python_thread_names: HashMap<u64, String>,
+    pub python_thread_names: HashMap<u64, Option<String>>,
+    thread_name_lookup_time: Instant,
     #[cfg(target_os = "linux")]
     pub dockerized: bool,
 }
@@ -96,6 +98,7 @@ impl PythonSpy {
             short_filenames: HashMap::new(),
             python_thread_ids: HashMap::new(),
             python_thread_names: HashMap::new(),
+            thread_name_lookup_time: Instant::now(),
         })
     }
 
@@ -229,6 +232,8 @@ impl PythonSpy {
         let gil_thread_id = get_gil_threadid::<I, Process>(self.threadstate_address, &self.process)
             .context("failed to get gil_thread_id")?;
 
+        let mut did_thread_name_lookup = false;
+
         let mut traces = Vec::new();
         let mut threads = threads_head;
         while !threads.is_null() {
@@ -283,7 +288,8 @@ impl PythonSpy {
                 trace.os_thread_id = os_thread_id.map(|id| id as u64);
             }
 
-            trace.thread_name = self._get_python_thread_name(python_thread_id);
+            trace.thread_name =
+                self._get_python_thread_name(&mut did_thread_name_lookup, python_thread_id);
             trace.owns_gil = owns_gil;
             trace.pid = self.process.pid;
 
@@ -538,12 +544,37 @@ impl PythonSpy {
         Ok(None)
     }
 
-    fn _get_python_thread_name(&mut self, python_thread_id: u64) -> Option<String> {
+    fn _get_python_thread_name(
+        &mut self,
+        did_thread_name_lookup: &mut bool,
+        python_thread_id: u64,
+    ) -> Option<String> {
+        // a thread can get a name after the lookup, for instance when the threading module
+        // is imported later, so look up threads without a name again once the lookup is this old
+        const THREAD_NAME_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
         match self.python_thread_names.get(&python_thread_id) {
-            Some(thread_name) => Some(thread_name.clone()),
-            None => {
-                self.python_thread_names = thread_name_lookup(self).unwrap_or_default();
-                self.python_thread_names.get(&python_thread_id).cloned()
+            Some(Some(thread_name)) => Some(thread_name.clone()),
+            Some(None) if self.thread_name_lookup_time.elapsed() < THREAD_NAME_RETRY_INTERVAL => {
+                None
+            }
+            _ => {
+                // avoid triggering a lookup if we already did one during this sample
+                if !*did_thread_name_lookup {
+                    info!("looking up thread names");
+                    self.python_thread_names = thread_name_lookup(self)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| (k, Some(v)))
+                        .collect();
+                    self.thread_name_lookup_time = Instant::now();
+                    *did_thread_name_lookup = true;
+                }
+                // avoid triggering a lookup next time if the thread has no name
+                self.python_thread_names
+                    .entry(python_thread_id)
+                    .or_insert(None)
+                    .clone()
             }
         }
     }
